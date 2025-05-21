@@ -1,0 +1,14 @@
+{
+  "watched_instruments": [
+    {
+      "channel": "mark-price",
+      "instId": "BTC-USDT",
+      "enabled": true
+    },
+    {
+      "channel": "mark-price",
+      "instId": "ETH-USDT-SWAP",
+      "enabled": true
+    }
+  ]
+}
