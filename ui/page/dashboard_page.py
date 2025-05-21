@@ -1,282 +1,211 @@
 import asyncio
 import logging
 from nicegui import ui, app
-from typing import cast  # 用于类型转换，配合NiceGUI的element
-
-# 项目内部导入
+from typing import cast
 from ws_util.public_channel_manager import PublicChannelManager
-from ui.component.trading_pair_card import TradingPairCard  # TradingPairCard现在需要更多参数
+from ui.component.trading_pair_card import TradingPairCard  # 假设 TradingPairCard 保持不变
 import db_manager
 from app_models import TradingPair
 
 logger = logging.getLogger(__name__)
 
-# 全局变量或使用 app.state 来管理核心服务实例
+# 全局变量
 pcm_instance: PublicChannelManager | None = None
 trading_pair_cards: dict[str, TradingPairCard] = {}
-cards_container: ui.grid | None = None
+cards_container: ui.grid | None = None  # UI容器的引用
 
 
-def price_update_handler_factory(id_to_update: str):
+def price_update_handler_factory(inst_id: str):
+    """为指定instId创建价格更新回调处理函数。"""
+
     def handler(price: str):
-        logger.debug(f"UI: 收到价格更新 for {id_to_update}: {price}")
-        if id_to_update in trading_pair_cards:
-            # 确保卡片仍然认为自己是启用的才更新价格文本
-            if trading_pair_cards[id_to_update].is_enabled:
-                trading_pair_cards[id_to_update].update_price(price)
-        else:
-            logger.warning(f"UI: 未找到 {id_to_update} 的卡片来更新价格。")
+        if inst_id in trading_pair_cards and trading_pair_cards[inst_id].is_enabled:
+            trading_pair_cards[inst_id].update_price(price)
 
     return handler
 
 
-async def handle_delete_pair(pair_id: int, inst_id: str, card_instance: TradingPairCard):
-    """处理删除交易对的逻辑"""
-    global pcm_instance
-    logger.info(f"UI: 请求删除交易对 ID: {pair_id}, InstID: {inst_id}")
+async def _update_single_pair_monitoring_status(
+        pair_id: int, inst_id: str, card: TradingPairCard, target_status: bool
+) -> bool:
+    """核心：更新单个交易对的监控状态 (DB, UI, PCM)。返回DB操作是否成功。"""
+    if card.is_enabled == target_status:  # 如果状态未变，则不执行操作
+        return True  # 认为操作“成功”，因为状态已是目标状态
 
+    if not db_manager.update_trading_pair(pair_id, {"is_enabled": target_status}):
+        logger.error(f"DB更新失败: {inst_id} 至 {target_status}")
+        return False
+
+    card.update_enabled_status_ui(target_status)  # 更新卡片UI（包括is_enabled属性）
+    logger.info(f"DB与UI更新: {inst_id} 至 {'启用' if target_status else '禁用'}")
+
+    if pcm_instance:
+        if target_status:  # 目标：启用
+            logger.debug(f"PCM: 订阅 {inst_id}")
+            await pcm_instance.subscribe_mark_price(inst_id, resubscribe_check=False)
+            pcm_instance.register_price_update_callback(inst_id, price_update_handler_factory(inst_id))
+        else:  # 目标：禁用
+            logger.debug(f"PCM: 取消订阅 {inst_id}")
+            await pcm_instance.unsubscribe_mark_price(inst_id)
+            pcm_instance.unregister_price_update_callback(inst_id)
+    return True
+
+
+async def handle_delete_pair(pair_id: int, inst_id: str, card: TradingPairCard):
+    """处理删除交易对。"""
     confirm_dialog = ui.dialog()
     with confirm_dialog, ui.card():
-        ui.label(f"确定要删除交易对 {inst_id} 吗？此操作不可恢复。")
+        ui.label(f"确定删除 {inst_id} ？")
         with ui.row().classes('justify-end w-full'):
             ui.button("取消", on_click=confirm_dialog.close)
 
             async def do_delete():
                 confirm_dialog.close()
-                # 1. 从数据库删除
+                was_enabled = card.is_enabled  # 记录删除前的状态
                 if db_manager.delete_trading_pair(pair_id):
-                    logger.info(f"DB: 已删除交易对 ID: {pair_id}")
-
-                    # 2. 取消订阅并注销回调
-                    if pcm_instance:
+                    if was_enabled and pcm_instance:  # 如果之前是启用的，才需要取消订阅
                         await pcm_instance.unsubscribe_mark_price(inst_id)
                         pcm_instance.unregister_price_update_callback(inst_id)
-                        logger.info(f"PCM: 已取消订阅并注销回调 for {inst_id}")
-
-                    # 3. 从UI和内部字典中移除
-                    if inst_id in trading_pair_cards:
-                        del trading_pair_cards[inst_id]
-
-                    # 从NiceGUI中删除卡片UI
-                    # card_instance.ui_container.delete() # NiceGUI 0.9+
-                    cast(ui.element, card_instance.ui_container).delete()  # 更通用的方式删除元素
-
-                    ui.notify(f"已删除交易对 {inst_id}", type='positive', position='top')
+                    if inst_id in trading_pair_cards: del trading_pair_cards[inst_id]
+                    cast(ui.element, card.ui_container).delete()
+                    ui.notify(f"已删除 {inst_id}", type='positive')
                 else:
-                    logger.error(f"DB: 删除交易对 ID: {pair_id} 失败")
-                    ui.notify(f"删除交易对 {inst_id} 失败", type='error', position='top')
+                    ui.notify(f"删除 {inst_id} 失败", type='error')
 
             ui.button("删除", on_click=do_delete, color='negative')
     await confirm_dialog
 
 
-async def handle_toggle_enable_pair(pair_id: int, inst_id: str, new_enabled_status: bool,
-                                    card_instance: TradingPairCard):
-    """处理启用/禁用交易对的逻辑"""
-    global pcm_instance
-    logger.info(f"UI: 请求切换交易对 ID: {pair_id}, InstID: {inst_id} 至状态: {new_enabled_status}")
-
-    # 1. 更新数据库
-    if db_manager.update_trading_pair(pair_id, {"is_enabled": new_enabled_status}):
-        logger.info(f"DB: 已更新交易对 ID: {pair_id} 的启用状态为 {new_enabled_status}")
-
-        # 更新卡片实例的内部状态和UI
-        card_instance.update_enabled_status_ui(new_enabled_status)
-
-        # 2. 处理订阅/取消订阅和回调
-        if pcm_instance:
-            if new_enabled_status:
-                logger.info(f"PCM: 为 {inst_id} 启用监控 (订阅并注册回调)")
-                await pcm_instance.subscribe_mark_price(inst_id, resubscribe_check=False)  # 强制尝试订阅
-                pcm_instance.register_price_update_callback(
-                    inst_id,
-                    price_update_handler_factory(inst_id)
-                )
-            else:
-                logger.info(f"PCM: 为 {inst_id} 禁用监控 (取消订阅并注销回调)")
-                await pcm_instance.unsubscribe_mark_price(inst_id)
-                pcm_instance.unregister_price_update_callback(inst_id)
-
-        ui.notify(f"交易对 {inst_id} 已 {'启用' if new_enabled_status else '禁用'}", type='info', position='top')
+async def handle_toggle_enable_pair(pair_id: int, inst_id: str, new_status: bool, card: TradingPairCard):
+    """处理单个交易对启用/禁用切换。"""
+    success = await _update_single_pair_monitoring_status(pair_id, inst_id, card, new_status)
+    if success:
+        ui.notify(f"{inst_id} 已{'启用' if new_status else '禁用'}", type='info')
     else:
-        logger.error(f"DB: 更新交易对 ID: {pair_id} 状态失败")
-        ui.notify(f"更新 {inst_id} 状态失败", type='error', position='top')
-        # 如果数据库更新失败，回滚UI状态
-        card_instance.update_enabled_status_ui(not new_enabled_status)
+        ui.notify(f"更新 {inst_id} 状态失败", type='error')
+        card.update_enabled_status_ui(not new_status)  # DB失败时回滚UI
+
+
+async def mass_toggle_monitoring(enable_all: bool):
+    """批量启用或禁用所有与目标状态不同的交易对。"""
+    action_text = "启用" if enable_all else "禁用"
+    to_process = [c for c in trading_pair_cards.values() if c.is_enabled != enable_all]
+    if not to_process:
+        ui.notify(f"所有交易对均已是“{action_text}”状态。", type='info')
+        return
+
+    results = await asyncio.gather(
+        *(_update_single_pair_monitoring_status(c.pair_id, c.inst_id, c, enable_all) for c in to_process),
+        return_exceptions=True  # 收集所有结果，包括异常
+    )
+
+    successful_ops = sum(1 for r in results if r is True)
+    failed_ops = len(results) - successful_ops
+
+    if successful_ops > 0:
+        ui.notify(f"成功{action_text} {successful_ops} 个交易对。", type='positive')
+    if failed_ops > 0:
+        ui.notify(f"{failed_ops} 个交易对状态更新失败。", type='error')
+        # 对于失败的操作，其卡片UI可能没有被回滚（因为gather中单个失败不会触发单个的回滚逻辑）
+        # 需要更复杂的逻辑来精确回滚批量操作中的失败项，或提示用户刷新
+        logger.warning(f"批量{action_text}操作中，有{failed_ops}个失败，结果: {results}")
+        # ui.notify("部分操作失败，建议刷新页面以同步状态。", type='warning', duration=7)
 
 
 async def setup_page_content():
+    """构建或重建页面UI内容。"""
     global pcm_instance, cards_container, trading_pair_cards
-
-    # 在页面重建时，如果希望保持简单，可以考虑清空 trading_pair_cards
-    # 但当前我们假设 trading_pair_cards 在应用生命周期内（非重启）是持久的，
-    # 并且此函数主要在初始构建或需要完全重绘时被调用。
-    # 如果此函数被频繁调用且 trading_pair_cards 未清空，可能会导致重复的UI元素或逻辑问题。
-    # 为了简化，我们假设 trading_pair_cards 在调用此函数前是相关页面实例的最新状态。
-    # 或者，更健壮的方式是在函数开始时清理旧卡片（如果它们仅由此函数管理）。
-    # current_instIds_in_ui = set(trading_pair_cards.keys()) # 获取当前UI中的instId
-    # db_instIds = set() # 之后会从数据库获取
-
-    monitored_pairs_from_db = db_manager.get_all_trading_pairs()
-    # for pair_model in monitored_pairs_from_db:
-    #     db_instIds.add(pair_model.instId)
-
-    # # 清理UI上存在但数据库中已不存在的卡片 (例如，如果数据库在外部被修改)
-    # for inst_id_to_remove in current_instIds_in_ui - db_instIds:
-    #     if inst_id_to_remove in trading_pair_cards:
-    #         cast(ui.element, trading_pair_cards[inst_id_to_remove].ui_container).delete()
-    #         del trading_pair_cards[inst_id_to_remove]
-    #         logger.info(f"UI: 清理了数据库中不再存在的卡片: {inst_id_to_remove}")
 
     with ui.column().classes('items-center w-full q-pa-md'):
         ui.label("加密货币行情监控").classes('text-3xl font-bold text-primary mb-6')
-        cards_container = ui.grid(columns=3).classes('gap-4 w-full max-w-4xl')
 
-        with cards_container:
-            # 确保trading_pair_cards在开始时是空的，或者正确地管理已存在的卡片
-            # 为简单起见，这里假设在页面加载时，我们总是从数据库重建卡片列表的UI部分
-            # 但Python对象可以复用（如果instId已在trading_pair_cards中）
+        with ui.row().classes('mb-4 gap-x-2'):
+            ui.button("全部开始", on_click=lambda: mass_toggle_monitoring(True), icon='play_arrow', color='positive')
+            ui.button("全部暂停", on_click=lambda: mass_toggle_monitoring(False), icon='pause', color='warning')
 
-            # 先清除cards_container中的所有旧UI元素，以避免重复添加
-            cards_container.clear()
-            # 清除trading_pair_cards字典，因为我们将根据数据库重新创建所有卡片对象和UI
-            # 注意：这简化了UI重建逻辑，但如果卡片有复杂内部状态不想丢失，则需更细致处理
-            existing_keys = list(trading_pair_cards.keys())
-            for k in existing_keys:  # 先取消所有旧回调和订阅
-                if pcm_instance:
-                    await pcm_instance.unsubscribe_mark_price(k)  # 尝试取消订阅
-                    pcm_instance.unregister_price_update_callback(k)  # 注销回调
-            trading_pair_cards.clear()
+        current_cards_container = cards_container  # 捕获当前容器引用
+        if current_cards_container:  # 如果容器已存在，先清空
+            current_cards_container.clear()
+        else:  # 如果容器不存在（首次加载），创建它
+            cards_container = ui.grid(columns=3).classes('gap-4 w-full max-w-4xl')
+            current_cards_container = cards_container
 
-            for pair_model in monitored_pairs_from_db:
-                # 无论 pair_model.is_enabled 如何，都创建卡片，卡片内部会处理显示状态
+        # 清理PCM相关的旧资源 (订阅和回调)
+        if pcm_instance:
+            for inst_id_old in list(trading_pair_cards.keys()):  # 使用副本迭代
+                await pcm_instance.unsubscribe_mark_price(inst_id_old)
+                pcm_instance.unregister_price_update_callback(inst_id_old)
+        trading_pair_cards.clear()  # 清空内存中的卡片字典
+
+        db_pairs = db_manager.get_all_trading_pairs()
+        logger.info(f"从数据库加载到 {len(db_pairs)} 个交易对用于显示。")
+
+        with current_cards_container:  # 在（可能已清空的）容器内构建
+            for pair_model in db_pairs:
+                if not pair_model.id: continue  # 跳过无ID的记录 (不应发生)
                 card = TradingPairCard(
-                    inst_id=pair_model.instId,
-                    pair_id=pair_model.id,  # 确保 pair_model.id 是有效的数据库ID
-                    is_enabled=pair_model.is_enabled,
-                    on_toggle_enable=handle_toggle_enable_pair,
-                    on_delete=handle_delete_pair,
-                    initial_price="加载中..."  # 卡片内部会根据is_enabled调整
+                    inst_id=pair_model.instId, pair_id=pair_model.id, is_enabled=pair_model.is_enabled,
+                    on_toggle_enable=handle_toggle_enable_pair, on_delete=handle_delete_pair
                 )
                 trading_pair_cards[pair_model.instId] = card
-                logger.info(
-                    f"UI: 为 {pair_model.instId} (id: {pair_model.id}) 创建/更新了卡片。Enabled: {pair_model.is_enabled}")
+                if pair_model.is_enabled and pcm_instance:  # 如果启用，则订阅
+                    await pcm_instance.subscribe_mark_price(pair_model.instId, resubscribe_check=False)
+                    pcm_instance.register_price_update_callback(
+                        pair_model.instId, price_update_handler_factory(pair_model.instId)
+                    )
 
-                if pair_model.is_enabled:
-                    if pcm_instance:
-                        logger.debug(f"UI: 初始加载, 请求订阅 {pair_model.instId}")
-                        await pcm_instance.subscribe_mark_price(pair_model.instId, resubscribe_check=False)
-                        pcm_instance.register_price_update_callback(
-                            pair_model.instId,
-                            price_update_handler_factory(pair_model.instId)
-                        )
-                # else: 卡片内部的 __init__ 会处理禁用时的视觉效果
-
+        # 添加新交易对的UI
         with ui.row(wrap=False).classes('mt-8 items-center gap-x-2'):
-            new_inst_id_input = ui.input(label="添加交易对 (例如 BTC-USDT-SWAP)",
-                                         placeholder="ETH-USDT-SWAP") \
+            new_inst_id_input = ui.input(label="添加交易对 (例如 BTC-USDT-SWAP)", placeholder="ETH-USDT-SWAP") \
                 .props('outlined dense clearable').classes('flex-grow')
 
-            async def handle_add_pair():
-                global cards_container, pcm_instance  # 确保访问的是最新的全局变量
-
-                inst_id = new_inst_id_input.value
-                if not inst_id:
-                    ui.notify("InstId 不能为空!", type='warning', position='top')
-                    return
-
-                inst_id = inst_id.strip().upper()
+            async def handle_add_pair_action():
+                inst_id = new_inst_id_input.value.strip().upper()
                 new_inst_id_input.value = ''
+                if not inst_id: return ui.notify("InstId不能为空!", type='warning')
+                if inst_id in trading_pair_cards: return ui.notify(f"{inst_id}已在监控中。", type='info')
 
-                if inst_id in trading_pair_cards:
-                    ui.notify(f"{inst_id} 已在监控列表中。", type='info', position='top')
-                    return
-
-                new_pair_model_data = TradingPair(instId=inst_id, is_enabled=True)
-                pair_db_id = db_manager.add_trading_pair(new_pair_model_data)
-
-                if pair_db_id is not None:
-                    logger.info(f"UI: {inst_id} 已成功添加到数据库 (ID: {pair_db_id})。")
-                    if cards_container is not None:
-                        with cards_container:  # 将新卡片添加到UI容器
-                            card = TradingPairCard(
-                                inst_id=inst_id,
-                                pair_id=pair_db_id,
-                                is_enabled=True,
-                                on_toggle_enable=handle_toggle_enable_pair,
-                                on_delete=handle_delete_pair,
-                                initial_price="待订阅..."
-                            )
-                            trading_pair_cards[inst_id] = card
-                    else:
-                        logger.error("UI: cards_container 未初始化，无法添加新卡片到UI。")
-
-                    if pcm_instance:
-                        logger.debug(f"UI: 添加新交易对后，请求订阅 {inst_id}")
-                        await pcm_instance.subscribe_mark_price(inst_id, resubscribe_check=False)
-                        pcm_instance.register_price_update_callback(
-                            inst_id,
-                            price_update_handler_factory(inst_id)
+                pair_db_id = db_manager.add_trading_pair(TradingPair(instId=inst_id, is_enabled=True))
+                if pair_db_id and current_cards_container:  # 确保ID有效且容器存在
+                    with current_cards_container:  # 在现有容器中添加新卡片
+                        card = TradingPairCard(
+                            inst_id=inst_id, pair_id=pair_db_id, is_enabled=True,
+                            on_toggle_enable=handle_toggle_enable_pair, on_delete=handle_delete_pair,
+                            initial_price="待订阅..."
                         )
-                    ui.notify(f"已添加并开始监控 {inst_id}。", type='positive', position='top')
-                else:
-                    logger.warning(f"UI: 添加 {inst_id} 到数据库失败。可能已存在。")
-                    existing_pair_in_db = None
-                    all_db_pairs = db_manager.get_all_trading_pairs()
-                    for p_db in all_db_pairs:
-                        if p_db.instId == inst_id:
-                            existing_pair_in_db = p_db
-                            break
-                    if existing_pair_in_db:
-                        ui.notify(f"{inst_id} 已存在于数据库中。", type='info', position='top')
-                    else:
-                        ui.notify(f"添加 {inst_id} 到数据库时发生未知错误。", type='error', position='top')
+                    trading_pair_cards[inst_id] = card
+                    if pcm_instance:  # 订阅新添加的
+                        await pcm_instance.subscribe_mark_price(inst_id, resubscribe_check=False)
+                        pcm_instance.register_price_update_callback(inst_id, price_update_handler_factory(inst_id))
+                    ui.notify(f"已添加并监控 {inst_id}", type='positive')
+                elif not pair_db_id:  # 添加到DB失败
+                    ui.notify(f"添加 {inst_id} 失败 (可能已在数据库中)", type='error')
 
-            ui.button("添加监控", on_click=handle_add_pair).props('color=primary icon=add')
+            ui.button("添加监控", on_click=handle_add_pair_action).props('color=primary icon=add')
 
 
 async def on_app_startup():
     global pcm_instance
-    logging.info("Dashboard: 应用启动中...")
+    logger.info("应用启动...")
     db_manager.initialize_database()
+    if not db_manager.get_all_trading_pairs():  # 如果数据库为空
+        db_manager.add_trading_pair(TradingPair(instId="BTC-USDT-SWAP", is_enabled=True))
+        logger.info("已添加默认交易对 BTC-USDT-SWAP。")
 
-    all_pairs = db_manager.get_all_trading_pairs()
-    if not all_pairs:
-        default_pair = TradingPair(instId="BTC-USDT-SWAP", is_enabled=True)
-        added_id = db_manager.add_trading_pair(default_pair)
-        if added_id:
-            logging.info(f"已添加默认交易对 {default_pair.instId} (ID: {added_id}) 到数据库。")
-        else:
-            if not db_manager.get_all_trading_pairs():
-                logging.error(f"添加默认交易对 {default_pair.instId} 到数据库失败，且数据库仍为空。")
-            else:
-                logging.info(f"默认交易对 {default_pair.instId} 可能已被其他方式添加。")
-
-    if pcm_instance is None:
-        pcm_instance = PublicChannelManager()
-    asyncio.create_task(pcm_instance.start())
-    logging.info("Dashboard: PublicChannelManager 启动任务已创建。")
+    if pcm_instance is None: pcm_instance = PublicChannelManager()
+    asyncio.create_task(pcm_instance.start())  # 启动PCM
 
 
 async def on_app_shutdown():
-    global pcm_instance, trading_pair_cards
-    logging.info("Dashboard: 应用关闭中...")
+    global pcm_instance
+    logger.info("应用关闭...")
     if pcm_instance:
-        # 在停止PCM之前，注销所有回调并尝试取消订阅
-        inst_ids_to_cleanup = list(trading_pair_cards.keys())
-        logger.info(f"关闭前清理PCM订阅和回调 for: {inst_ids_to_cleanup}")
-        for inst_id in inst_ids_to_cleanup:
+        # 尝试清理所有已知订阅 (从trading_pair_cards获取，因PCM内部可能没有完整列表)
+        for inst_id in list(trading_pair_cards.keys()):
             await pcm_instance.unsubscribe_mark_price(inst_id)
             pcm_instance.unregister_price_update_callback(inst_id)
-
-        # 短暂等待，确保取消订阅消息有机会发出
-        # await asyncio.sleep(0.5) # 根据网络情况调整或移除
-
         await pcm_instance.stop()
-        logging.info("Dashboard: PublicChannelManager 已停止。")
-
     trading_pair_cards.clear()
-    logger.info("Dashboard: trading_pair_cards 已清空。")
 
 
 def create_dashboard_page():
@@ -284,21 +213,11 @@ def create_dashboard_page():
     app.on_shutdown(on_app_shutdown)
 
     @ui.page('/')
-    async def dashboard_page_builder():
-        # 此函数在每次客户端连接到此页面时调用，或在热重载时调用。
-        # 我们希望每次都基于数据库的当前状态构建UI。
-        await setup_page_content()
+    async def dashboard_builder(): await setup_page_content()
 
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(name)s (%(threadName)s): %(message)s',  # 更详细的日志格式
-        datefmt='%H:%M:%S'
-    )
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+                        datefmt='%H:%M:%S')
     create_dashboard_page()
-    ui.run(
-        title="OKX行情监控仪表盘",
-        reload=False,  # reload=True 在开发复杂状态管理时需谨慎
-        port=8080
-    )
+    ui.run(title="OKX行情监控", reload=False, port=8080)
