@@ -1,6 +1,6 @@
 # ui/components/rule_editor_form.py
 from nicegui import ui
-from typing import Dict, Any, Callable, Optional, Awaitable  # 新增 Awaitable
+from typing import Dict, Any, Callable, Optional, Awaitable
 from app_models import AlertRule
 
 # 预警条件选项
@@ -14,7 +14,7 @@ class RuleEditorForm:
     def __init__(self,
                  trading_pair_id: int,
                  inst_id: str,
-                 on_save: Callable[[AlertRule], Awaitable[None]],  # 修改 Callable 返回值为 Awaitable[None]
+                 on_save: Callable[[AlertRule], Awaitable[None]],
                  rule_to_edit: Optional[AlertRule] = None
                  ):
         self.trading_pair_id = trading_pair_id
@@ -43,11 +43,20 @@ class RuleEditorForm:
                     step=0.01
                 ).props('outlined dense hide-bottom-space').classes('w-full mb-2')
 
+                initial_condition = 'above'
+                if rule_to_edit and rule_to_edit.params:
+                    loaded_condition = rule_to_edit.params.get("condition")
+                    if loaded_condition in CONDITION_OPTIONS:
+                        initial_condition = loaded_condition
+                    else:
+                        print(
+                            f"[WARN] RuleEditorForm: Invalid condition '{loaded_condition}' loaded for rule '{rule_to_edit.name if rule_to_edit else 'new rule'}'. Defaulting to 'above'.")
+
                 self.condition_select = ui.select(
-                    CONDITION_OPTIONS,
+                    options=CONDITION_OPTIONS,  # 使用原始字典
                     label="触发条件",
-                    value=rule_to_edit.params.get("condition") if rule_to_edit and rule_to_edit.params else 'above'
-                ).props('outlined dense emit-value map-options hide-bottom-space').classes('w-full mb-2')
+                    value=initial_condition
+                ).props('outlined dense map-options hide-bottom-space')  # 移除了 emit-value
 
                 self.cooldown_input = ui.number(
                     label="冷却时间 (秒)",
@@ -63,25 +72,30 @@ class RuleEditorForm:
 
             with ui.card_actions().classes('justify-end px-4 pb-3'):
                 ui.button("取消", on_click=self.dialog.close, color='grey').props('flat')
-                # save_rule 现在是 async，NiceGUI on_click 可以处理 async 回调
                 ui.button("保存", on_click=self.save_rule, color='primary')
 
     def _generate_human_readable_condition(self, threshold: Optional[float], condition_key: Optional[str]) -> str:
         if threshold is None or condition_key is None:
             return "条件未完整设置"
-        condition_text = CONDITION_OPTIONS.get(condition_key, condition_key)
+        condition_text = CONDITION_OPTIONS.get(condition_key, str(condition_key))
         return f"{condition_text} {threshold:.2f}"
 
-    async def save_rule(self):  # <--- 修改为 async def
-        """收集表单数据并调用保存回调"""
+    async def save_rule(self):
         name_val = self.rule_name_input.value
         threshold_val = self.threshold_price_input.value
+        # 即使没有 emit-value，NiceGUI 的 .value 属性也应该返回处理后的 Python 值
         condition_val = self.condition_select.value
         cooldown_val = self.cooldown_input.value
         enabled_val = self.is_enabled_switch.value
 
         if not name_val or threshold_val is None or condition_val is None or cooldown_val is None:
             ui.notify("所有字段均为必填项！", type='warning')
+            return
+
+        if condition_val not in CONDITION_OPTIONS:
+            ui.notify(f"选择的条件 '{condition_val}' 无效。请重新选择。", type='error')
+            print(
+                f"[ERROR] RuleEditorForm.save_rule: Invalid condition_val='{condition_val}' (type: {type(condition_val)}). Expected one of {list(CONDITION_OPTIONS.keys())}.")
             return
 
         try:
@@ -119,8 +133,7 @@ class RuleEditorForm:
                 human_readable_condition=human_readable,
             )
 
-        await self.on_save_callback(rule_data)  # <--- 使用 await 调用
-        # ui.notify(...) 应该由回调函数 _handle_save_alert_rule 在 dashboard_page.py 中处理
+        await self.on_save_callback(rule_data)
         self.dialog.close()
 
     def open(self):
