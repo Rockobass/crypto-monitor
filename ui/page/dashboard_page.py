@@ -3,7 +3,7 @@ import logging
 from nicegui import ui, app
 from typing import cast
 from ws_util.public_channel_manager import PublicChannelManager
-from ui.component.trading_pair_card import TradingPairCard  # 假设 TradingPairCard 保持不变
+from ui.component.trading_pair_card import TradingPairCard
 import db_manager
 from app_models import TradingPair
 
@@ -17,7 +17,6 @@ cards_container: ui.grid | None = None  # UI容器的引用
 
 def price_update_handler_factory(inst_id: str):
     """为指定instId创建价格更新回调处理函数。"""
-
     def handler(price: str):
         if inst_id in trading_pair_cards and trading_pair_cards[inst_id].is_enabled:
             trading_pair_cards[inst_id].update_price(price)
