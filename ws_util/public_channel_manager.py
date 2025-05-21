@@ -16,7 +16,7 @@ class PublicChannelManager:
 
         self._prices: Dict[str, str] = {}  # 存储instId对应的价格
         self._price_update_callbacks: Dict[str, Callable[[str], None]] = {}  # instId对应的价格更新回调函数
-        self.default_inst_id = "BTC-USDT-SWAP"  # 默认订阅的交易对ID
+        # self.default_inst_id = "BTC-USDT-SWAP" # 删除：不再由频道管理器硬编码默认订阅
         self._active_subscriptions: Set[str] = set()  # 跟踪活跃的订阅，格式为 "channel:instId"
 
     def _on_message(self, message: Any):
@@ -33,7 +33,6 @@ class PublicChannelManager:
 
         if not channel or not inst_id_from_arg:  # 如果关键信息缺失，记录日志并跳过后续处理
             logger.debug(f"消息缺少 'channel' 或 'instId' 字段: {message}")
-            # 对于某些错误消息，可能没有arg中的channel和instId，比如登录失败
             if event == "error":
                 logger.error(f"操作错误: {message.get('msg')} (代码: {message.get('code')}) 原始消息: {message}")
             return
@@ -59,19 +58,39 @@ class PublicChannelManager:
                         self._price_update_callbacks[price_inst_id](mark_px)
 
     async def _on_connection_status(self, is_connected: bool):
-        # 处理WebSocket连接状态的变化，连接成功时自动订阅默认交易对
+        # 处理WebSocket连接状态的变化
         logger.info(f"频道管理器: 连接状态: {'已连接' if is_connected else '已断开'}")
         if is_connected:
-            logger.info(f"连接成功，尝试订阅默认交易对: {self.default_inst_id}")
-            # 连接时强制重新订阅，即使之前认为已订阅，因为服务器可能已丢失状态
-            await self.subscribe_mark_price(self.default_inst_id, resubscribe_check=False)
+            logger.info(f"连接成功，将根据当前UI需求订阅/恢复订阅...")
+            # 获取当前UI层面期望订阅的instId列表
+            desired_inst_ids = list(self._price_update_callbacks.keys())
+
+            # 清除旧的 _active_subscriptions，因为我们将根据当前需求重新订阅并等待服务器确认
+            # 服务端可能已丢失之前的订阅状态，所以我们总是重新发起。
+            self._active_subscriptions.clear()
+
+            if not desired_inst_ids:
+                logger.info("当前没有UI请求的交易对需要订阅。")
+            else:
+                logger.info(f"将为 {len(desired_inst_ids)} 个交易对发起/确认标记价格订阅: {desired_inst_ids}")
+
+            for inst_id in desired_inst_ids:
+                # 使用 subscribe_mark_price, resubscribe_check=False 确保发送订阅请求
+                # 因为 _active_subscriptions 刚被清空 (或确保在连接恢复时重新声明意图)
+                await self.subscribe_mark_price(inst_id, resubscribe_check=False)
+        # else: # is_connected is False
+        # 连接断开。 ws_client_public 会尝试重连。
+        # 成功重连后，is_connected=True 分支的逻辑会执行。
+        # _active_subscriptions 此时反映的是断开前的状态，会在重连成功后被清空并重建。
 
     async def _send_subscription_op(self, op_type: str, channel: str, inst_id: str) -> bool:
         # 内部辅助函数：发送订阅或取消订阅的指令到WebSocket
         op_payload = {"op": op_type, "args": [{"channel": channel, "instId": inst_id}]}
-        success = await self.client.send_json_payload(op_payload)  #
-        log_level = logger.info if success else logger.error  # 根据成功与否选择日志级别
-        log_level(f"{op_type.capitalize()} {'成功' if success else '失败'} for channel '{channel}' on {inst_id}")
+        success = await self.client.send_json_payload(op_payload)
+        log_level = logger.info if success else logger.error
+        # 日志级别调整：发送尝试本身可以是INFO，后续的成功/失败事件会更明确
+        logger.debug(
+            f"尝试 {op_type.capitalize()} channel '{channel}' on {inst_id}. 发送状态: {'成功' if success else '失败/排队'}")
         return success
 
     async def subscribe_mark_price(self, inst_id: str, resubscribe_check: bool = True):
@@ -80,15 +99,26 @@ class PublicChannelManager:
         if resubscribe_check and subscription_key in self._active_subscriptions:
             logger.info(f"已经订阅 {subscription_key}, 无需重复发送订阅请求。")
             return
+        logger.info(f"请求订阅标记价格 for {inst_id}")
         await self._send_subscription_op("subscribe", "mark-price", inst_id)
 
     async def unsubscribe_mark_price(self, inst_id: str):
         # 公开方法：取消订阅指定instId的标记价格频道
         subscription_key = f"mark-price:{inst_id}"
-        if subscription_key not in self._active_subscriptions:
-            logger.info(f"未订阅 {subscription_key}, 无需发送取消订阅请求。")
-            return
+        # 取消订阅前检查 price_update_callbacks，确保UI不再需要它
+        if inst_id not in self._price_update_callbacks:
+            logger.info(f"InstId {inst_id} 已无UI回调, 可能无需取消订阅或已被处理。")
+            # 即使没有回调，如果存在于_active_subscriptions中，也应该取消
+
+        if subscription_key not in self._active_subscriptions and inst_id not in self._price_update_callbacks:  # 更宽松的检查
+            logger.info(f"似乎未订阅 {subscription_key} 或UI不关心, 无需发送取消订阅请求。")
+            # return # 取消注释此行，如果希望更严格地避免不必要的取消订阅指令
+
+        logger.info(f"请求取消订阅标记价格 for {inst_id}")
         await self._send_subscription_op("unsubscribe", "mark-price", inst_id)
+        # 主动从 _active_subscriptions 移除，不等服务器响应，以更快反映意图
+        # 服务器的 unsubscribe 事件仍然会处理，但这是为了防止重连逻辑错误地恢复它
+        self._active_subscriptions.discard(subscription_key)
 
     def get_price(self, inst_id: str) -> Optional[str]:
         # 公开方法：获取指定instId的当前缓存价格
@@ -103,15 +133,21 @@ class PublicChannelManager:
 
     def unregister_price_update_callback(self, inst_id: str):
         # 公开方法：取消注册指定instId的价格更新回调函数
-        self._price_update_callbacks.pop(inst_id, None)  # 使用pop并提供默认值None，避免KeyError
+        self._price_update_callbacks.pop(inst_id, None)
 
     async def start(self):
         # 公开方法：启动底层的WebSocket客户端（它将在后台异步运行）
         logger.info("PublicChannelManager: 正在启动底层WebSocket客户端...")
-        asyncio.create_task(self.client.start())  #
+        asyncio.create_task(self.client.start())
 
     async def stop(self):
         # 公开方法：停止底层的WebSocket客户端
         logger.info("PublicChannelManager: 正在停止...")
-        await self.client.stop()  #
+        # 在停止客户端前，可以尝试取消所有活动订阅
+        # inst_ids_to_unsubscribe = list(self._price_update_callbacks.keys())
+        # for inst_id in inst_ids_to_unsubscribe:
+        #     await self.unsubscribe_mark_price(inst_id)
+        # await asyncio.sleep(0.5) # 短暂等待取消订阅操作发出
+
+        await self.client.stop()
         logger.info("PublicChannelManager: 已停止。")
