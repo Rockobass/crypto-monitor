@@ -1,4 +1,3 @@
-# ui/components/rule_editor_form.py
 from nicegui import ui
 from typing import Dict, Any, Callable, Optional, Awaitable
 from app_models import AlertRule
@@ -83,7 +82,6 @@ class RuleEditorForm:
     async def save_rule(self):
         name_val = self.rule_name_input.value
         threshold_val = self.threshold_price_input.value
-        # 即使没有 emit-value，NiceGUI 的 .value 属性也应该返回处理后的 Python 值
         condition_val = self.condition_select.value
         cooldown_val = self.cooldown_input.value
         enabled_val = self.is_enabled_switch.value
