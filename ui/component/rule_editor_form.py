@@ -1,3 +1,4 @@
+# ui/component/rule_editor_form.py
 from nicegui import ui
 from typing import Dict, Any, Callable, Optional, Awaitable
 from app_models import AlertRule
@@ -38,8 +39,8 @@ class RuleEditorForm:
                     label="阈值价格 (USDT)",
                     value=float(rule_to_edit.params.get("threshold_price",
                                                         0.0)) if rule_to_edit and rule_to_edit.params else None,
-                    format="%.2f",
-                    step=0.01
+                    # format="%.2f", # <-- 移除了格式化限制
+                    step='any'       # <-- 允许输入任意浮点数
                 ).props('outlined dense hide-bottom-space').classes('w-full mb-2')
 
                 initial_condition = 'above'
@@ -55,7 +56,7 @@ class RuleEditorForm:
                     options=CONDITION_OPTIONS,  # 使用原始字典
                     label="触发条件",
                     value=initial_condition
-                ).props('outlined dense map-options hide-bottom-space')  # 移除了 emit-value
+                ).props('outlined dense map-options hide-bottom-space')
 
                 self.cooldown_input = ui.number(
                     label="冷却时间 (秒)",
@@ -77,7 +78,8 @@ class RuleEditorForm:
         if threshold is None or condition_key is None:
             return "条件未完整设置"
         condition_text = CONDITION_OPTIONS.get(condition_key, str(condition_key))
-        return f"{condition_text} {threshold:.2f}"
+        # <-- 修改了格式化，以显示完整的浮点数
+        return f"{condition_text} {threshold}"
 
     async def save_rule(self):
         name_val = self.rule_name_input.value
