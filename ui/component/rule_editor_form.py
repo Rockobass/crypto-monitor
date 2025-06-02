@@ -39,7 +39,6 @@ class RuleEditorForm:
                     label="阈值价格 (USDT)",
                     value=float(rule_to_edit.params.get("threshold_price",
                                                         0.0)) if rule_to_edit and rule_to_edit.params else None,
-                    # format="%.2f", # <-- 移除了格式化限制
                     step='any'       # <-- 允许输入任意浮点数
                 ).props('outlined dense hide-bottom-space').classes('w-full mb-2')
 

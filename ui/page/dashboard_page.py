@@ -358,15 +358,7 @@ async def on_app_startup():
         logger.info("已添加默认交易对 BTC-USDT-SWAP。")
 
     if pcm_instance is None: pcm_instance = PublicChannelManager()
-    if alert_processor_instance is None: alert_processor_instance = AlertProcessor()  # 初始化 AlertProcessor
-
-    # 在页面内容构建完成后，AlertProcessor 会通过 load_rules_for_pair 填充
-    # 或者，可以在这里遍历所有已启用的交易对，并为其加载规则到 AlertProcessor
-    # all_db_pairs = db_manager.get_all_trading_pairs()
-    # for pair in all_db_pairs:
-    #     if pair.is_enabled and pair.id:
-    #         alert_processor_instance.load_rules_for_pair(pair.id, pair.instId)
-
+    if alert_processor_instance is None: alert_processor_instance = AlertProcessor()
     asyncio.create_task(pcm_instance.start())
 
 
@@ -390,8 +382,6 @@ def create_dashboard_page():
 
     @ui.page('/')
     async def dashboard_builder():
-        # 确保 alert_processor_instance 在 setup_page_content 之前已创建
-        # （在 on_app_startup 中处理）
         await setup_page_content()
 
 
