@@ -26,6 +26,7 @@ class AlertRule(BaseModel):
     human_readable_condition: Optional[str] = Field(default=None, description="预警条件的人类可读描述")
     cooldown_seconds: int = Field(default=60, description="预警冷却时间（秒）")
     last_triggered_timestamp: Optional[float] = Field(default=None, description="此预警最后被触发的时间戳（内存状态）")
+    is_threshold_breached: bool = Field(default=False, description="[Internal In-Memory State for Price Alerts] Tracks if the price threshold has been crossed and not yet reset. Not persisted to DB.")
 
     class Config:
         from_attributes = True
